@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller Build Artifacts
+build/
+dist/
+*.spec
+
+#/ environment
+venv/
+include/
+
+# version
+version/
+# IDE Settings
+.vscode/
+.idea/
+
+# Data and Media Files
+*.csv
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.log
+*.7z
+
+
+#dll
+*.dll
+*.a
