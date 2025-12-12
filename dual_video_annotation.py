@@ -36,9 +36,22 @@ except ImportError:
 except OSError:
     print("错误: 未找到 mpv 动态库 (mpv-1.dll)。请检查")
 
+# 尝试导入音频分析相关库
+AUDIO_ANALYSIS_AVAILABLE = False
+try:
+    import numpy as np
+    import librosa
+    import matplotlib
+    matplotlib.use('Qt5Agg')
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+    from matplotlib.figure import Figure
+    AUDIO_ANALYSIS_AVAILABLE = True
+except ImportError as e:
+    print(f"音频分析库导入失败: {e}")
+
 import pandas as pd
 from PyQt5.QtCore import Qt, QUrl, QThread, pyqtSignal, QObject, QEvent
-from PyQt5.QtGui import QGuiApplication
+from PyQt5.QtGui import QGuiApplication, QPainter, QPen, QColor, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -145,6 +158,250 @@ class VideoLoaderThread(QThread):
             
         except Exception as e:
             self.error.emit(f"扫描过程中发生错误: {str(e)}")
+
+
+class AudioAnalysisThread(QThread):
+    finished = pyqtSignal(object) # 发送 QPixmap
+    error = pyqtSignal(str)
+
+    def __init__(self, video_path: str, width: int, height: int):
+        super().__init__()
+        self.video_path = video_path
+        self.width = width
+        self.height = height
+
+    def run(self):
+        if not AUDIO_ANALYSIS_AVAILABLE:
+            return
+
+        # 检查并配置 ffmpeg 环境
+        self._ensure_ffmpeg()
+
+        try:
+            # 1. 加载音频
+            # librosa.load 内部会尝试使用 soundfile (不支持 avi) 和 audioread (依赖 ffmpeg)
+            # 忽略 PySoundFile failed 的警告 (因为 soundfile 不支持视频容器是预期的)
+            # 忽略 librosa 的 FutureWarning (关于 audioread 后端将在未来版本移除的警告)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="PySoundFile failed. Trying audioread instead.")
+                warnings.filterwarnings("ignore", category=FutureWarning)
+                y, sr = librosa.load(self.video_path, sr=None)
+            
+            # 2. 计算梅尔频谱
+            # 使用较小的 hop_length 以获得更高的时间分辨率
+            hop_length = 512
+            S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, hop_length=hop_length)
+            S_dB = librosa.power_to_db(S, ref=np.max)
+
+            # 发送原始数据而不是图片
+            self.finished.emit((S_dB, sr, hop_length))
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+    def _ensure_ffmpeg(self):
+        """
+        检查系统是否安装了 ffmpeg。
+        如果没有，尝试导入或安装 imageio-ffmpeg，并将其路径添加到环境变量 PATH 中，
+        以便 librosa (audioread) 可以找到它。
+        """
+        import shutil
+        if shutil.which("ffmpeg"):
+            return # 系统中已有 ffmpeg
+
+        print("未检测到系统 ffmpeg，正在检查 imageio-ffmpeg...")
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            print("未找到 imageio-ffmpeg，正在尝试自动安装...")
+            try:
+                import subprocess
+                import sys
+                # 尝试自动安装，使用清华源加速
+                subprocess.check_call([
+                    sys.executable, "-m", "pip", "install", 
+                    "imageio-ffmpeg", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"
+                ])
+                import imageio_ffmpeg
+            except Exception as e:
+                print(f"自动安装 imageio-ffmpeg 失败: {e}")
+                return
+
+        try:
+            # 获取 ffmpeg 可执行文件路径
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+            
+            # imageio-ffmpeg 的可执行文件通常带有版本号，如 ffmpeg-win64-v4.2.2.exe
+            # 但 audioread 只会查找 "ffmpeg" 命令
+            # 因此我们需要复制一份并重命名为 ffmpeg.exe
+            target_ffmpeg = os.path.join(ffmpeg_dir, 'ffmpeg.exe')
+            if not os.path.exists(target_ffmpeg):
+                try:
+                    shutil.copy(ffmpeg_exe, target_ffmpeg)
+                    print(f"已创建 ffmpeg.exe 副本于: {target_ffmpeg}")
+                except Exception as e:
+                    print(f"创建 ffmpeg.exe 副本失败: {e}")
+
+            # 将其目录添加到 PATH
+            if ffmpeg_dir not in os.environ["PATH"]:
+                os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ["PATH"]
+                print(f"已临时将 ffmpeg 添加到 PATH: {ffmpeg_dir}")
+        except Exception as e:
+            print(f"配置 imageio-ffmpeg 失败: {e}")
+
+
+
+class MelSpectrogramWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(100)
+        self.S_dB: Optional[np.ndarray] = None
+        self.sr: int = 22050
+        self.hop_length: int = 512
+        self.current_time_ms: int = 0
+        self.loading = False
+        self.setStyleSheet("background-color: #2b2b2b;")
+        
+        # 预计算 colormap
+        try:
+            import matplotlib.cm as cm
+            # 获取 colormap 查找表 (256, 4) -> (256, 4) uint8
+            self.cmap = cm.get_cmap('magma')
+            # 使用 0-1 的浮点数生成 LUT
+            self.cmap_lut = (self.cmap(np.linspace(0, 1, 256)) * 255).astype(np.uint8)
+        except:
+            self.cmap_lut = None
+
+    def load_audio(self, video_path: str):
+        if not AUDIO_ANALYSIS_AVAILABLE:
+            return
+            
+        self.S_dB = None
+        self.loading = True
+        self.update()
+        
+        # 启动线程分析
+        self.thread = AudioAnalysisThread(video_path, self.width(), self.height())
+        self.thread.finished.connect(self.on_analysis_finished)
+        self.thread.error.connect(self.on_analysis_error)
+        self.thread.start()
+
+    def on_analysis_finished(self, data):
+        # data is (S_dB, sr, hop_length)
+        self.S_dB, self.sr, self.hop_length = data
+        self.loading = False
+        self.update()
+
+    def on_analysis_error(self, msg):
+        print(f"Audio analysis error: {msg}")
+        self.loading = False
+        self.update()
+
+    def set_current_time(self, time_ms: int):
+        self.current_time_ms = time_ms
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # 绘制背景
+        painter.fillRect(self.rect(), QColor("#2b2b2b"))
+
+        if self.loading:
+            painter.setPen(Qt.white)
+            painter.drawText(self.rect(), Qt.AlignCenter, "正在生成频谱图...")
+            return
+
+        if self.S_dB is not None and self.cmap_lut is not None:
+            # 计算当前时间对应的帧索引
+            current_frame = int((self.current_time_ms / 1000) * self.sr / self.hop_length)
+            
+            # 计算显示窗口（前后0.5秒）
+            # 0.5秒对应的帧数
+            half_window_frames = int(0.5 * self.sr / self.hop_length)
+            
+            start_frame = current_frame - half_window_frames
+            end_frame = current_frame + half_window_frames
+            
+            # 处理边界情况，进行填充
+            n_mels, n_frames = self.S_dB.shape
+            
+            # 提取切片
+            # 如果超出范围，需要填充
+            pad_left = 0
+            pad_right = 0
+            
+            real_start = start_frame
+            real_end = end_frame
+            
+            if start_frame < 0:
+                pad_left = -start_frame
+                real_start = 0
+            
+            if end_frame > n_frames:
+                pad_right = end_frame - n_frames
+                real_end = n_frames
+                
+            if real_start < real_end:
+                slice_data = self.S_dB[:, real_start:real_end]
+            else:
+                slice_data = np.zeros((n_mels, 0))
+
+            # 归一化到 0-255
+            # 假设 S_dB 范围大概在 -80 到 0
+            min_db = -80.0
+            max_db = 0.0
+            
+            norm_data = (slice_data - min_db) / (max_db - min_db)
+            norm_data = np.clip(norm_data, 0, 1)
+            img_data = (norm_data * 255).astype(np.uint8)
+            
+            # 应用 colormap
+            # img_data shape: (n_mels, width)
+            # mapped shape: (n_mels, width, 4)
+            mapped = self.cmap_lut[img_data]
+            
+            # 如果需要填充
+            if pad_left > 0:
+                left_pad = np.zeros((n_mels, pad_left, 4), dtype=np.uint8)
+                # 填充黑色或深色
+                left_pad[:] = self.cmap_lut[0] 
+                mapped = np.hstack((left_pad, mapped))
+                
+            if pad_right > 0:
+                right_pad = np.zeros((n_mels, pad_right, 4), dtype=np.uint8)
+                right_pad[:] = self.cmap_lut[0]
+                mapped = np.hstack((mapped, right_pad))
+            
+            # 转换为 QImage
+            # mapped 是 (height, width, 4) RGBA
+            # QImage 需要 contiguous buffer
+            mapped = np.ascontiguousarray(mapped)
+            h, w, c = mapped.shape
+            image = QImage(mapped.data, w, h, w * 4, QImage.Format_RGBA8888)
+            
+            # 垂直翻转（因为频谱图低频在下，矩阵索引0在上）
+            # librosa specshow 默认 origin='lower'，但矩阵是 (freq, time)
+            # 矩阵第0行是低频。如果不翻转，第0行会画在上面。
+            # 所以我们需要镜像翻转
+            image = image.mirrored(False, True)
+            
+            # 绘制
+            painter.drawImage(self.rect(), image)
+
+        # 绘制中心线
+        center_x = self.width() // 2
+        painter.setPen(QPen(QColor("#ff0000"), 2))
+        painter.drawLine(center_x, 0, center_x, self.height())
+        
+        if not AUDIO_ANALYSIS_AVAILABLE:
+             painter.setPen(Qt.gray)
+             painter.drawText(self.rect(), Qt.AlignCenter, "未安装 librosa/matplotlib，无法显示频谱")
 
 
 class MpvWidget(QWidget):
@@ -272,14 +529,24 @@ class MpvPlayer(QObject):
     def play(self):
         if hasattr(self, 'mpv'):
             self.mpv.pause = False
+            # 手动更新状态以确保 UI 同步，防止 mpv 属性回调延迟或丢失导致的状态不一致
+            if self._state != MpvPlayer.PlayingState:
+                self._state = MpvPlayer.PlayingState
+                self.stateChanged.emit(MpvPlayer.PlayingState)
 
     def pause(self):
         if hasattr(self, 'mpv'):
             self.mpv.pause = True
+            if self._state != MpvPlayer.PausedState:
+                self._state = MpvPlayer.PausedState
+                self.stateChanged.emit(MpvPlayer.PausedState)
 
     def stop(self):
         if hasattr(self, 'mpv'):
             self.mpv.stop()
+            if self._state != MpvPlayer.StoppedState:
+                self._state = MpvPlayer.StoppedState
+                self.stateChanged.emit(MpvPlayer.StoppedState)
 
     def setPosition(self, position_ms, fast=False):
         if hasattr(self, 'mpv'):
@@ -511,12 +778,24 @@ class AnnotationApp(QMainWindow):
         progress_layout.addWidget(self.position_slider, stretch=1)
         progress_layout.addWidget(self.time_label)
 
+        # 梅尔频谱显示区域
+        self.spectrogram_widget = MelSpectrogramWidget()
+        self.spectrogram_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.spectrogram_widget.setFixedHeight(self._scaled(100))
+
         playback_layout = QHBoxLayout()
         playback_layout.setSpacing(self._scaled(10))
 
         self.play_button = QPushButton("播放")
         self.play_button.setEnabled(False)
         self.play_button.clicked.connect(self.toggle_playback)
+
+        # 快进快退步长选择
+        seek_label = QLabel("快进/退:")
+        self.seek_step_combo = QComboBox()
+        self.seek_step_combo.addItems(["1s", "2s", "5s", "10s", "30s"])
+        self.seek_step_combo.setCurrentText("5s")
+        self.seek_step_combo.setFixedWidth(self._scaled(60))
 
         speed_label = QLabel("倍速:")
         self.speed_combo = QComboBox()
@@ -526,6 +805,9 @@ class AnnotationApp(QMainWindow):
         self.speed_combo.currentIndexChanged.connect(self.on_speed_changed)
 
         playback_layout.addWidget(self.play_button)
+        playback_layout.addSpacing(self._scaled(16))
+        playback_layout.addWidget(seek_label)
+        playback_layout.addWidget(self.seek_step_combo)
         playback_layout.addSpacing(self._scaled(16))
         playback_layout.addWidget(speed_label)
         playback_layout.addWidget(self.speed_combo)
@@ -588,6 +870,7 @@ class AnnotationApp(QMainWindow):
         main_layout.addLayout(folder_layout)
         main_layout.addLayout(navigation_layout)
         main_layout.addLayout(video_layout, stretch=1)
+        main_layout.addWidget(self.spectrogram_widget) # 添加频谱图
         main_layout.addLayout(progress_layout)
         main_layout.addLayout(playback_layout)
         main_layout.addWidget(annotations_frame)
@@ -616,6 +899,22 @@ class AnnotationApp(QMainWindow):
         }}
         QLineEdit {{ padding: {self._scaled(3)}px {self._scaled(5)}px; background-color: #fafafa; border: 1px solid #dddddd; }}
         QComboBox {{ padding: {self._scaled(3)}px {self._scaled(5)}px; }}
+        
+        /* 增强进度条样式 */
+        QSlider::groove:horizontal {{
+            border: 1px solid #999999;
+            height: {self._scaled(10)}px; 
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #B1B1B1, stop:1 #c4c4c4);
+            margin: 2px 0;
+            border-radius: {self._scaled(5)}px;
+        }}
+        QSlider::handle:horizontal {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #b4b4b4, stop:1 #8f8f8f);
+            border: 1px solid #5c5c5c;
+            width: {self._scaled(18)}px;
+            margin: -{self._scaled(5)}px 0; 
+            border-radius: {self._scaled(3)}px;
+        }}
         """
         self.setStyleSheet(style_sheet)
 
@@ -772,6 +1071,11 @@ class AnnotationApp(QMainWindow):
         self._suppress_combo_signal = False
 
         self.load_media_sources(path_a, path_b)
+        
+        # 加载音频频谱
+        if AUDIO_ANALYSIS_AVAILABLE:
+            self.spectrogram_widget.load_audio(str(path_a.resolve()))
+            
         self.reset_annotation_state()
         self.restore_annotations_for_current()
         self.update_navigation_buttons()
@@ -898,6 +1202,10 @@ class AnnotationApp(QMainWindow):
 
         duration = max(self.player_a.duration(), 1)
         self.update_time_label(position, duration)
+        
+        # 更新频谱图进度
+        if duration > 0 and AUDIO_ANALYSIS_AVAILABLE:
+            self.spectrogram_widget.set_current_time(position)
 
         # 同步逻辑优化 v2：以音频源 (Player B) 为基准，调整视频源 (Player A) 的速度
         # 这样可以保证音频流畅，不会出现爆音或变调
@@ -1130,6 +1438,40 @@ class AnnotationApp(QMainWindow):
                                  f"无法播放视频。\n错误信息: {error_message}\n\n"
                                  "提示: AVI格式通常需要安装额外的解码器。\n"
                                  "请尝试安装 'LAV Filters' 或 'K-Lite Codec Pack'。")
+
+    def keyPressEvent(self, event):
+        # 如果焦点在输入框上，不处理快捷键，让输入框处理（移动光标等）
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, QLineEdit):
+            super().keyPressEvent(event)
+            return
+
+        if event.key() == Qt.Key_Left:
+            self.seek_relative(-self.get_seek_step())
+        elif event.key() == Qt.Key_Right:
+            self.seek_relative(self.get_seek_step())
+        elif event.key() == Qt.Key_Space:
+            self.toggle_playback()
+        else:
+            super().keyPressEvent(event)
+
+    def get_seek_step(self) -> int:
+        text = self.seek_step_combo.currentText()
+        try:
+            return int(text.replace('s', '')) * 1000
+        except ValueError:
+            return 5000
+
+    def seek_relative(self, delta_ms: int):
+        if self.player_a.mediaStatus() in (MpvPlayer.NoMedia, MpvPlayer.InvalidMedia):
+            return
+        
+        current_pos = self.player_a.position()
+        duration = self.player_a.duration()
+        new_pos = max(0, min(duration, current_pos + delta_ms))
+        
+        self.player_a.setPosition(new_pos)
+        self.player_b.setPosition(new_pos)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.persist_annotations()

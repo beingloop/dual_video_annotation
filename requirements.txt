@@ -1,0 +1,7 @@
+PyQt5
+python-mpv
+pandas
+librosa
+numpy
+matplotlib
+imageio-ffmpeg
