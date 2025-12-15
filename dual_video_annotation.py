@@ -636,6 +636,7 @@ class AnnotationApp(QMainWindow):
         self._suppress_combo_signal: bool = False
         self.loader_thread: Optional[VideoLoaderThread] = None
         self.last_jump_interval: Optional[str] = None  # 记录上次跳转的区间，避免重复跳转
+        self.current_audio_source: str = 'B' # 当前音频来源 'A' 或 'B'，默认 'B' (辅视角)
 
         self._build_ui()
         self._build_players()
@@ -804,6 +805,12 @@ class AnnotationApp(QMainWindow):
         self.speed_combo.setEnabled(False)
         self.speed_combo.currentIndexChanged.connect(self.on_speed_changed)
 
+        self.audio_source_btn = QPushButton("音频源: 辅视角")
+        self.audio_source_btn.setCheckable(True)
+        self.audio_source_btn.setChecked(True) # 默认 B (辅视角)
+        self.audio_source_btn.clicked.connect(self.toggle_audio_source)
+        self.audio_source_btn.setEnabled(False)
+
         playback_layout.addWidget(self.play_button)
         playback_layout.addSpacing(self._scaled(16))
         playback_layout.addWidget(seek_label)
@@ -811,6 +818,8 @@ class AnnotationApp(QMainWindow):
         playback_layout.addSpacing(self._scaled(16))
         playback_layout.addWidget(speed_label)
         playback_layout.addWidget(self.speed_combo)
+        playback_layout.addSpacing(self._scaled(16))
+        playback_layout.addWidget(self.audio_source_btn)
         playback_layout.addStretch()
 
         annotations_frame = QFrame()
@@ -1051,6 +1060,7 @@ class AnnotationApp(QMainWindow):
         self.play_button.setEnabled(True)
         self.speed_combo.setEnabled(True)
         self.position_slider.setEnabled(True)
+        self.audio_source_btn.setEnabled(True)
 
         self.load_video_at_index(0)
         self.statusBar().showMessage(f"加载完成，已配对 {len(self.video_pairs)} 个视频，当前加载 {shared_names[0]}")
@@ -1074,7 +1084,8 @@ class AnnotationApp(QMainWindow):
         
         # 加载音频频谱
         if AUDIO_ANALYSIS_AVAILABLE:
-            self.spectrogram_widget.load_audio(str(path_a.resolve()))
+            audio_path = path_a if self.current_audio_source == 'A' else path_b
+            self.spectrogram_widget.load_audio(str(audio_path.resolve()))
             
         self.reset_annotation_state()
         self.restore_annotations_for_current()
@@ -1095,9 +1106,15 @@ class AnnotationApp(QMainWindow):
         self.player_a.setMedia(str(abs_path_a))
         self.player_b.setMedia(str(abs_path_b))
         
-        # 重新应用静音设置，防止切换视频后重置
-        self.player_a.setMuted(True)
-        self.player_b.setVolume(80)
+        # 根据当前音频源设置静音
+        if self.current_audio_source == 'A':
+            self.player_a.setMuted(False)
+            self.player_a.setVolume(80)
+            self.player_b.setMuted(True)
+        else:
+            self.player_a.setMuted(True)
+            self.player_b.setMuted(False)
+            self.player_b.setVolume(80)
 
         self.player_a.setPlaybackRate(self.get_selected_speed())
         self.player_b.setPlaybackRate(self.get_selected_speed())
@@ -1173,6 +1190,40 @@ class AnnotationApp(QMainWindow):
     def show_next_video(self) -> None:
         if self.current_index < len(self.video_pairs) - 1:
             self.load_video_at_index(self.current_index + 1)
+
+    def toggle_audio_source(self) -> None:
+        if self.current_index < 0 or self.current_index >= len(self.video_pairs):
+            return
+
+        # 切换状态
+        if self.current_audio_source == 'B':
+            self.current_audio_source = 'A'
+            self.audio_source_btn.setText("音频源: 主视角")
+            self.audio_source_btn.setChecked(False)
+            
+            # 切换播放器静音状态
+            self.player_a.setMuted(False)
+            self.player_a.setVolume(80)
+            self.player_b.setMuted(True)
+            
+            # 重新加载频谱图
+            if AUDIO_ANALYSIS_AVAILABLE:
+                path = self.video_pairs[self.current_index][1] # path_a
+                self.spectrogram_widget.load_audio(str(path.resolve()))
+        else:
+            self.current_audio_source = 'B'
+            self.audio_source_btn.setText("音频源: 辅视角")
+            self.audio_source_btn.setChecked(True)
+            
+            # 切换播放器静音状态
+            self.player_a.setMuted(True)
+            self.player_b.setMuted(False)
+            self.player_b.setVolume(80)
+            
+            # 重新加载频谱图
+            if AUDIO_ANALYSIS_AVAILABLE:
+                path = self.video_pairs[self.current_index][2] # path_b
+                self.spectrogram_widget.load_audio(str(path.resolve()))
 
     def toggle_playback(self) -> None:
         if self.player_a.mediaStatus() in (MpvPlayer.NoMedia, MpvPlayer.InvalidMedia):
