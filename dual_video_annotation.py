@@ -50,7 +50,7 @@ except ImportError as e:
     print(f"音频分析库导入失败: {e}")
 
 import pandas as pd
-from PyQt5.QtCore import Qt, QUrl, QThread, pyqtSignal, QObject, QEvent
+from PyQt5.QtCore import Qt, QUrl, QThread, pyqtSignal, QObject, QEvent, QTimer
 from PyQt5.QtGui import QGuiApplication, QPainter, QPen, QColor, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -642,6 +642,7 @@ class AnnotationApp(QMainWindow):
         self.loader_thread: Optional[VideoLoaderThread] = None
         self.last_jump_interval: Optional[str] = None  # 记录上次跳转的区间，避免重复跳转
         self.current_audio_source: str = 'B' # 当前音频来源 'A' 或 'B'，默认 'B' (辅视角)
+        self.is_jumping: bool = False # 标记是否正在进行跳转操作
 
         self._build_ui()
         self._build_players()
@@ -986,12 +987,31 @@ class AnnotationApp(QMainWindow):
                     total_ms = (minutes * 60 + seconds) * 1000
                     
                     # 执行跳转
+                    self.is_jumping = True
+                    was_playing = self.player_a.state() == MpvPlayer.PlayingState
+                    
+                    if was_playing:
+                        self.player_a.pause()
+                        self.player_b.pause()
+
                     self.player_a.setPosition(total_ms)
                     self.player_b.setPosition(total_ms)
                     self.last_jump_interval = target_interval
-                    # print(f"DEBUG: Jump to {target_interval} -> {total_ms}ms")
+                    
+                    if was_playing:
+                        # 延迟恢复播放，避免爆音和同步冲突
+                        QTimer.singleShot(200, self._resume_playback)
+                    else:
+                        self.is_jumping = False
+                        
         except ValueError:
             pass
+
+    def _resume_playback(self):
+        self.player_a.play()
+        self.player_b.play()
+        # 稍微再延迟一点释放锁，确保播放状态稳定
+        QTimer.singleShot(100, lambda: setattr(self, 'is_jumping', False))
 
     def _build_players(self) -> None:
         self.player_a = MpvPlayer(self.video_widget_a)
@@ -1288,6 +1308,10 @@ class AnnotationApp(QMainWindow):
         # 更新频谱图进度
         if duration > 0 and AUDIO_ANALYSIS_AVAILABLE:
             self.spectrogram_widget.set_current_time(position)
+
+        # 如果正在跳转，跳过同步逻辑
+        if self.is_jumping:
+            return
 
         # 同步逻辑优化 v2：以音频源 (Player B) 为基准，调整视频源 (Player A) 的速度
         # 这样可以保证音频流畅，不会出现爆音或变调
