@@ -30,3 +30,6 @@ version/
 #dll
 *.dll
 *.a
+
+#myfile
+标注记录.md
