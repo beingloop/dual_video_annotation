@@ -591,6 +591,11 @@ class MpvPlayer(QObject):
     def errorString(self):
         return "MPV Error"
 
+    def get_metadata(self):
+        if hasattr(self, 'mpv'):
+            return self.mpv.metadata
+        return {}
+
 
 class AnnotationApp(QMainWindow):
     def __init__(self) -> None:
@@ -776,8 +781,14 @@ class AnnotationApp(QMainWindow):
             f"color: #333333; font-weight: bold; font-size: {self._scaled_font(10)}pt;"
         )
 
+        self.date_label = QLabel("")
+        self.date_label.setStyleSheet(
+            f"color: #333333; font-size: {self._scaled_font(10)}pt; margin-left: {self._scaled(10)}px;"
+        )
+
         progress_layout.addWidget(self.position_slider, stretch=1)
         progress_layout.addWidget(self.time_label)
+        progress_layout.addWidget(self.date_label)
 
         # 梅尔频谱显示区域
         self.spectrogram_widget = MelSpectrogramWidget()
@@ -1244,6 +1255,26 @@ class AnnotationApp(QMainWindow):
         self.position_slider.setRange(0, duration)
         self.position_slider.blockSignals(False)
         self.update_time_label(self.player_a.position(), duration)
+        self.update_date_display()
+
+    def update_date_display(self) -> None:
+        if self.current_index < 0 or self.current_index >= len(self.video_pairs):
+            self.date_label.setText("")
+            return
+
+        try:
+            # 获取当前主视角视频路径
+            path_a = self.video_pairs[self.current_index][1]
+            # 获取文件修改时间
+            mtime = path_a.stat().st_mtime
+            
+            from datetime import datetime
+            date_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+            
+            self.date_label.setText(f"修改时间: {date_str}")
+        except Exception as e:
+            print(f"获取日期失败: {e}")
+            self.date_label.setText("")
 
     def on_position_changed(self, position: int) -> None:
         if not self.slider_pressed:
