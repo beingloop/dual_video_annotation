@@ -66,6 +66,8 @@ from PyQt5.QtWidgets import (
     QSlider,
     QSizePolicy,
     QStatusBar,
+    QStyle,
+    QStyleOptionSlider,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -597,6 +599,34 @@ class MpvPlayer(QObject):
         return {}
 
 
+class ClickableSlider(QSlider):
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            sr = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+
+            if sr.contains(event.pos()):
+                super().mousePressEvent(event)
+                return
+
+            if self.orientation() == Qt.Horizontal:
+                new_value = QStyle.sliderValueFromPosition(
+                    self.minimum(), self.maximum(), event.x(), self.width()
+                )
+            else:
+                new_value = QStyle.sliderValueFromPosition(
+                    self.minimum(), self.maximum(), event.y(), self.height()
+                )
+            self.setValue(new_value)
+            self.sliderMoved.emit(new_value)
+            self.sliderPressed.emit()
+            self.sliderReleased.emit()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+
 class AnnotationApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -771,7 +801,7 @@ class AnnotationApp(QMainWindow):
         progress_layout = QHBoxLayout()
         progress_layout.setSpacing(self._scaled(8))
 
-        self.position_slider = QSlider(Qt.Horizontal)
+        self.position_slider = ClickableSlider(Qt.Horizontal)
         self.position_slider.setEnabled(False)
         self.position_slider.sliderPressed.connect(self.on_slider_pressed)
         self.position_slider.sliderReleased.connect(self.on_slider_released)
